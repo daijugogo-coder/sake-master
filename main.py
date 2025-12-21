@@ -227,11 +227,19 @@ def call_llm(messages: List[Dict[str, str]], temperature: float = 0.6) -> str:
         "messages": messages,
         "temperature": temperature,
     }
+
     r = requests.post(url, headers=headers, json=payload, timeout=45)
-    r.raise_for_status()
+
+    # ★ここが最重要：400の本文をログに出す（Cloud Run Logsで見える）
+    if r.status_code >= 400:
+        print("=== OPENAI ERROR ===")
+        print("status:", r.status_code)
+        print("body:", r.text)   # ここに「どの項目が不正か」が入る
+        print("payload(model):", payload.get("model"))
+        raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text}")
+
     data = r.json()
     return data["choices"][0]["message"]["content"].strip()
-
 
 def build_system_prompt() -> str:
     return """
