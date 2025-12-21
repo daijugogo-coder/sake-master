@@ -1,0 +1,22 @@
+<!-- static/favicon.svg -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <style>
+      .bg { fill: #0f1115; }
+      .fg { fill: #eaeaea; }
+    </style>
+  </defs>
+
+  <!-- background -->
+  <circle cx="32" cy="32" r="30" class="bg"/>
+
+  <!-- eye / label -->
+  <rect x="30.5" y="14" width="3" height="28" rx="1.5" class="fg"/>
+
+  <!-- drop -->
+  <path class="fg"
+    d="M32 18
+       C28 24,24 28,24 34
+       a8 8 0 0 0 16 0
+       c0-6-4-10-8-16z"/>
+</svg>

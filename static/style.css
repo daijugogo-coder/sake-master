@@ -1,0 +1,21 @@
+:root { --bg:#0b0d10; --card:#12161c; --text:#e8eef7; --muted:#9aa7b7; --line:#232a33; }
+* { box-sizing: border-box; }
+body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+.wrap { max-width: 820px; margin: 0 auto; padding: 18px; }
+.header h1 { margin: 0 0 4px; font-size: 22px; }
+.sub { margin: 0 0 14px; color: var(--muted); font-size: 13px; }
+.chat { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px; height: 52vh; overflow:auto; }
+.msg { display:flex; gap:10px; margin: 10px 0; }
+.name { min-width: 72px; color: var(--muted); font-size: 12px; padding-top: 6px; }
+.bubble { background: #0f1319; border: 1px solid var(--line); border-radius: 14px; padding: 10px 12px; line-height: 1.5; white-space: pre-wrap; }
+.msg.customer .bubble { background: #131a24; }
+.panel { margin-top: 14px; background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px; }
+.hint { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
+.form { display:flex; flex-direction: column; gap: 8px; }
+.label { font-size: 12px; color: var(--muted); }
+.text, .file { background: #0f1319; color: var(--text); border: 1px solid var(--line); border-radius: 12px; padding: 10px; }
+.btn { background: #2a5bd7; color: white; border: 0; border-radius: 12px; padding: 10px 12px; cursor:pointer; }
+.btn.ghost { background: transparent; border: 1px solid #2a5bd7; color: #bcd0ff; }
+.row { display:flex; gap: 10px; }
+.sep { border:0; border-top:1px solid var(--line); margin: 14px 0; }
+.tiny { color: var(--muted); font-size: 12px; margin-top: 6px; }

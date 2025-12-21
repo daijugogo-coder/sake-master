@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Security outputs (optional: 残すなら消さない)
+# bandit.json
+# pip-audit.json
+# sbom.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+*.env
