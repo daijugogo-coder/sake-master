@@ -306,18 +306,27 @@ def index(request: Request):
 @app.post("/api/analyze")
 async def analyze(
     customer_text: str = Form(""),
-    photos: List[UploadFile] = File(...),   # ★複数枚
-    session_id: str = Form(""),            # ★既存セッションに追加するため（任意）
+    session_id: Optional[str] = Form(None),
+    photos: Optional[List[UploadFile]] = File(None),  # 任意
 ):
     """
-    Upload photo(s) -> OCR -> master reply
+    Upload photo(s) and/or message -> OCR (if photos) -> master reply
     - session_idが空なら新規セッション開始
-    - session_idがあれば、既存セッションに画像を追加して再回答
-    - photos は複数枚可（1枚でもOK）
+    - session_idがあれば、既存セッションに画像/発話を追加して再回答
+    - photos は複数枚可（なくてもOK）
     """
 
-    # If user didn't type anything, treat as "photo only"
-    customer_text = (customer_text or "").strip() or "（写真を投稿しました）"
+    # 正規化
+    customer_text = (customer_text or "").strip()
+    photo_count = len(photos) if photos else 0
+
+    # 両方ないなら「促す」
+    if photo_count == 0 and customer_text == "":
+        return {
+            "status": "need_more_info",
+            "session_id": session_id,
+            "master": "写真かメッセージのどちらかを送ってください。例えば『辛口が好き』だけでもOKです。"
+        }
 
     # 既存セッションか新規か
     if session_id and session_id in SESSIONS:
@@ -331,87 +340,87 @@ async def analyze(
         }
         SESSIONS[session_id] = sess
 
-    # 写真が無い場合（フロントが required/disabled でも念のため）
-    if not photos or len(photos) == 0:
-        return {
-            "status": "need_retake",
-            "master": "写真が選択されていないようです。写真を選んで送ってください。",
-            "session_id": session_id,
-        }
+    # テキストが空で写真だけなら、表示用に補う（LLM入力も空よりマシ）
+    if customer_text == "":
+        customer_text_for_llm = "（写真を投稿しました）"
+    else:
+        customer_text_for_llm = customer_text
 
-    # 今回の複数枚のOCR結果をまとめる（統合抽出用）
+    # 写真がある時だけOCR
     ocr_texts_this_request: List[str] = []
+    if photo_count > 0:
+        for photo in photos:
+            try:
+                image_bytes = await photo.read()
+            except Exception:
+                image_bytes = b""
 
-    # 複数枚を順にOCR
-    for idx, photo in enumerate(photos, start=1):
-        try:
-            image_bytes = await photo.read()
-        except Exception:
-            image_bytes = b""
+            if not image_bytes or len(image_bytes) < 1000:
+                return {
+                    "status": "need_retake",
+                    "master": "写真の一部が受け取れませんでした。もう一度、写真を選び直して送ってください。",
+                    "session_id": session_id,
+                }
 
-        if not image_bytes or len(image_bytes) < 1000:
-            # 1枚でも壊れてたら全体を止めるより「その写真はダメ」と返すほうが親切だが、
-            # MVPでは簡潔に「撮り直し」でまとめて返す
+            try:
+                ocr_text = run_ocr(image_bytes)
+            except Exception as e:
+                print("=== OCR ERROR ===")
+                traceback.print_exc()
+                return JSONResponse(
+                    {"status": "error", "message": f"OCRに失敗しました: {type(e).__name__}: {str(e)}"},
+                    status_code=500
+                )
+
+            if is_readable_enough(ocr_text):
+                ocr_texts_this_request.append(ocr_text)
+                extracted_each = extract_info(ocr_text)
+                sess["images"].append({
+                    "added_at": time.time(),
+                    "ocr_text": ocr_text,
+                    "extracted": asdict(extracted_each),
+                })
+
+        # 写真を送ったのに全部読めなかった場合は撮り直し促し
+        if photo_count > 0 and not ocr_texts_this_request:
+            master_msg = (
+                "成分表などの文字がうまく読み取れませんでした。\n"
+                "反射やピンぼけの可能性があります。\n"
+                "文字が大きく写るように撮って、もう一度お願いできますか？"
+            )
             return {
                 "status": "need_retake",
-                "master": "写真の一部が受け取れませんでした。もう一度、写真を選び直して送ってください。",
+                "master": master_msg,
                 "session_id": session_id,
             }
 
-        try:
-            ocr_text = run_ocr(image_bytes)
-        except Exception as e:
-            print("=== OCR ERROR ===")
-            traceback.print_exc()
-            return JSONResponse(
-                {"status": "error", "message": f"OCRに失敗しました: {type(e).__name__}: {str(e)}"},
-                status_code=500
-            )
+    # 会話履歴に今回の発話を積む（写真だけでも積む）
+    sess["history"].append({"role": "user", "content": f"お客様：{customer_text_for_llm}"})
 
-        # 読めない写真が混じるケース：ここは「その写真だけ無視」もできるが、
-        # UX的には“ちゃんと読めた情報だけで返す”のが自然。
-        # ただし全部読めないなら撮り直し。
-        if is_readable_enough(ocr_text):
-            ocr_texts_this_request.append(ocr_text)
+    # 抽出は「今回のOCR（あれば）」＋「過去OCRも少し」から作る
+    # 1) 今回OCRがあるならそれを優先
+    if ocr_texts_this_request:
+        combined_for_extract = "\n\n".join(ocr_texts_this_request)
+    else:
+        # 2) 写真が無くメッセージだけの場合：過去OCRがあればそれを少し使う
+        last_texts = [it["ocr_text"] for it in sess["images"][-2:]]  # 直近2枚程度
+        combined_for_extract = "\n\n".join(last_texts) if last_texts else ""
 
-            extracted_each = extract_info(ocr_text)
-            sess["images"].append({
-                "added_at": time.time(),
-                "ocr_text": ocr_text,
-                "extracted": asdict(extracted_each),
-            })
+    extracted = extract_info(combined_for_extract) if combined_for_extract else ExtractedInfo(category="unknown", keywords=[])
 
-    if not ocr_texts_this_request:
-        master_msg = (
-            "成分表などの文字がうまく読み取れませんでした。\n"
-            "瓶への直接印刷や反射の影響かもしれません。\n"
-            "文字が大きく写るように撮って、もう一度お願いできますか？"
-        )
-        return {
-            "status": "need_retake",
-            "master": master_msg,
-            "session_id": session_id,
-        }
-
-    # 会話履歴
-    sess["history"].append({"role": "user", "content": f"お客様：{customer_text}"})
-
-    # ★今回分を統合して “この一本” の抽出を作る（最新1枚より自然）
-    combined_for_extract = "\n\n".join(ocr_texts_this_request)
-    extracted = extract_info(combined_for_extract)
-
-    # LLMへ渡すOCRスニペット（直近複数枚）
-    ocr_snippets = []
-    for it in sess["images"]:
+    # LLMへ渡すOCRスニペット（直近数件）
+    ocr_snippets: List[str] = []
+    for it in sess["images"][-6:]:
         sn = (it["ocr_text"] or "").strip().replace("\r", "")
         if len(sn) > 300:
             sn = sn[:300] + "…"
         ocr_snippets.append(sn)
 
+    # LLM
     try:
         master_msg = master_reply(
             extracted=extracted,
-            customer_text=customer_text,
+            customer_text=customer_text_for_llm,
             chat_history=sess["history"],
             ocr_snippets=ocr_snippets,
         )
@@ -432,7 +441,7 @@ async def analyze(
         "extracted": asdict(extracted),
         "ocr_text_snippet": extracted.raw_text_snippet,
         "images_count": len(sess["images"]),
-        "uploaded_count": len(photos),
+        "uploaded_count": photo_count,
         "accepted_count": len(ocr_texts_this_request),
     }
 

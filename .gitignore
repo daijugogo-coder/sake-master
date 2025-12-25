@@ -14,3 +14,6 @@ Thumbs.db
 
 # Secrets
 *.env
+.venv/
+__pycache__
+*.pyc

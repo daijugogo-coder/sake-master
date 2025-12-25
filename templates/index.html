@@ -5,12 +5,14 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <title>Sake Master</title>
+
   <link rel="stylesheet" href="/static/style.css">
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
   <meta name="theme-color" content="#0f1115">
+
   <style>
-    /* 最小モーダル。色はstyle.cssに寄せたければ移してください */
+    /* ---- Modal ---- */
     .modal-backdrop {
       position: fixed;
       inset: 0;
@@ -30,18 +32,6 @@
       box-shadow: 0 20px 60px rgba(0, 0, 0, .45);
     }
 
-    .modal-title {
-      font-weight: 700;
-      margin: 0 0 6px;
-    }
-
-    .modal-sub {
-      margin: 0;
-      opacity: .85;
-      font-size: 14px;
-      line-height: 1.5;
-    }
-
     .spinner {
       margin-top: 12px;
       width: 18px;
@@ -49,76 +39,32 @@
       border-radius: 50%;
       border: 2px solid rgba(255, 255, 255, .25);
       border-top-color: rgba(255, 255, 255, .85);
-      animation: spin 0.9s linear infinite;
+      animation: spin .9s linear infinite;
     }
 
-    @keyframes spin {
-      to {
-        transform: rotate(360deg);
-      }
-    }
+    @keyframes spin { to { transform: rotate(360deg); } }
 
-    /* 追加：ヘッダ右ボタン + ファイル選択表示 */
-    .header-row {
+    .header-actions {
       display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 12px;
+      justify-content: flex-end;
+      margin-top: 6px;
     }
 
-    .reset-btn {
-      background: #e6e6e6;
-      color: #111;
+    .linkbtn {
+      background: none;
       border: none;
-      border-radius: 12px;
-      padding: 9px 12px;
+      padding: 4px 0;
       font-size: 13px;
-      font-weight: 600;
+      text-decoration: underline;
       cursor: pointer;
-      white-space: nowrap;
-      height: fit-content;
-      margin-top: 2px;
-
-      /* 押せる感を少し */
-      box-shadow:
-        0 1px 0 rgba(255, 255, 255, .6) inset,
-        0 2px 6px rgba(0, 0, 0, .25);
-
-      transition:
-        background .15s ease,
-        transform .05s ease,
-        box-shadow .05s ease;
-    }
-
-    .reset-btn:hover {
-      background: #dcdcdc;
-    }
-
-    .reset-btn:active {
-      transform: translateY(1px);
-      box-shadow:
-        0 1px 0 rgba(255, 255, 255, .4) inset,
-        0 1px 3px rgba(0, 0, 0, .3);
-    }
-
-    .reset-btn:disabled {
-      opacity: .5;
-      cursor: default;
-      box-shadow: none;
-    }
-
-    .help {
-      margin: 0 0 10px;
       opacity: .85;
-      font-size: 13px;
-      line-height: 1.45;
     }
 
-    .filehint {
-      margin-top: 8px;
-      font-size: 12px;
-      opacity: .85;
-      word-break: break-all;
+    label.btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
     }
   </style>
 </head>
@@ -126,12 +72,13 @@
 <body>
   <main class="wrap">
     <header class="header">
-      <div class="header-row">
-        <div>
-          <h1>Sake Master</h1>
-          <p class="sub">マスターと会話しながら、お酒の特徴と合わせ方を見つけます。</p>
-        </div>
-        <button id="resetBtn" class="reset-btn" type="button">次のお酒を相談する</button>
+      <h1>Sake Master</h1>
+      <p class="sub">マスターと会話しながら、お酒の特徴と合わせ方を見つけます。</p>
+
+      <div class="header-actions">
+        <button type="button" class="linkbtn" id="resetChatBtn">
+          会話を最初からやり直す
+        </button>
       </div>
     </header>
 
@@ -143,242 +90,92 @@
     </section>
 
     <section class="panel">
-      <div class="hint">{{ hint }}</div>
-
-      <!-- 写真 + お客様メッセージ（これ1つに統一） -->
       <form id="analyzeForm" class="form">
-        <input type="hidden" name="session_id" id="session_id" />
 
-        <p class="help">
-          写真は<strong>複数枚まとめて</strong>送れます（最初は1枚でもOK。あとから追加もできます）。<br>
-          例：1枚目=成分表 / 2枚目=表ラベル / 3枚目=バーコード など
-        </p>
+        <!-- 画像 -->
+        <label class="label">
+          商品のバーコード画像、もしくは成分表（原材料、度数など）、商品名の写る写真を送ってください。
+          <span class="filehint pc-only">PCの場合は複数の画像を一度に送ってください（最大3枚）</span>
 
-        <label class="label">成分表などの写真（複数可）</label>
-        <input class="file" type="file" id="photos" name="photos" accept="image/*" capture="environment" multiple
-          required />
+          <input
+            type="file"
+            name="photos"
+            id="photos"
+            accept="image/*"
+            capture="environment"
+            multiple
+            hidden
+          />
+
+          <span class="btn">画像撮影・選択</span>
+        </label>
+
         <div class="filehint" id="fileHint">未選択</div>
 
-        <label class="label">お客様からのメッセージ</label>
-        <input class="text" type="text" name="customer_text" id="customer_text" placeholder="例：辛口が好き。今日は魚。すっきりしたい。" />
+        <!-- テキスト -->
+        <label class="label">
+          お客様からのメッセージ
+          <input
+            class="text"
+            type="text"
+            name="customer_text"
+            id="customer_text"
+            placeholder="例：辛口が好き。今日は魚。すっきりしたい。"
+          />
+        </label>
 
-        <button class="btn" id="submitBtn" type="submit" disabled>伝える</button>
+        <button class="btn" id="submitBtn" type="submit" disabled>
+          伝える
+        </button>
+
       </form>
-
-      <div class="tiny" id="debug" style="display:none;"></div>
     </section>
   </main>
 
-  <!-- モーダル -->
+  <!-- Modal -->
   <div class="modal-backdrop" id="modal">
     <div class="modal">
-      <p class="modal-title" id="modalTitle">確認中</p>
-      <p class="modal-sub" id="modalSub">写真とメッセージを読み取っています。</p>
-      <div class="spinner" aria-label="loading"></div>
+      <p id="modalTitle">確認中</p>
+      <p id="modalSub">写真とメッセージを読み取っています。</p>
+      <div class="spinner"></div>
     </div>
   </div>
 
   <script>
     const chat = document.getElementById("chat");
-    const analyzeForm = document.getElementById("analyzeForm");
-    const sessionIdEl = document.getElementById("session_id");
-    const customerTextEl = document.getElementById("customer_text");
-
     const photosEl = document.getElementById("photos");
+    const customerTextEl = document.getElementById("customer_text");
     const fileHintEl = document.getElementById("fileHint");
     const submitBtn = document.getElementById("submitBtn");
-    const resetBtn = document.getElementById("resetBtn");
+    const resetChatBtn = document.getElementById("resetChatBtn");
 
-    const modal = document.getElementById("modal");
-    const modalTitle = document.getElementById("modalTitle");
-    const modalSub = document.getElementById("modalSub");
-
-    // session_idは「hidden input」ではなくJS側を正とする（重複append事故を防ぐ）
-    let sessionId = null;
-
-    function showModal(title = "確認中", sub = "写真とメッセージを読み取っています。") {
-      modalTitle.textContent = title;
-      modalSub.textContent = sub;
-      modal.style.display = "flex";
-    }
-    function hideModal() {
-      modal.style.display = "none";
-    }
-
-    // XSS対策：innerHTMLでユーザー文字列を埋めない（静的スキャンでも突かれにくい）
-    function addMsg(role, text) {
-      const div = document.createElement("div");
-      div.className = "msg " + (role === "master" ? "master" : "customer");
-
-      const nameDiv = document.createElement("div");
-      nameDiv.className = "name";
-      nameDiv.textContent = (role === "master" ? "マスター" : "お客様");
-
-      const bubbleDiv = document.createElement("div");
-      bubbleDiv.className = "bubble";
-      bubbleDiv.textContent = text;
-
-      div.appendChild(nameDiv);
-      div.appendChild(bubbleDiv);
-
-      chat.appendChild(div);
-      chat.scrollTop = chat.scrollHeight;
-    }
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+    if (isIOS) photosEl.removeAttribute("multiple");
 
     function updateFileUI() {
-      const files = photosEl.files;
-      const n = files ? files.length : 0;
-
-      if (!n) {
-        fileHintEl.textContent = "未選択";
-        submitBtn.disabled = true;
-        return;
-      }
-
-      const names = Array.from(files).map(f => f.name);
-      fileHintEl.textContent = `${n}枚選択：${names.join(" / ")}`;
-      submitBtn.disabled = false;
+      const n = photosEl.files.length;
+      const hasText = customerTextEl.value.trim().length > 0;
+      fileHintEl.textContent = n ? `${n}枚選択` : "未選択";
+      submitBtn.disabled = !(n || hasText);
     }
 
     photosEl.addEventListener("change", updateFileUI);
+    customerTextEl.addEventListener("input", updateFileUI);
 
-    async function fetchJson(url, options) {
-      const res = await fetch(url, options);
-      let data = {};
-      try { data = await res.json(); } catch (e) { /* ignore */ }
-
-      if (!res.ok) {
-        // サーバは {"message": "..."} / {"status":"error","message":"..."} など色々返すので吸収
-        const msg = data.message || data.detail || `HTTP ${res.status}`;
-        throw new Error(msg);
-      }
-      return data;
-    }
-
-    // /api/analyze に送る FormData を「確実に」作る（複数ファイル保証）
-    function buildAnalyzeFormData() {
-      const fd = new FormData();
-
-      // 複数ファイルは必ず自前でappend（FormData(form)任せにしない）
-      for (const f of photosEl.files) {
-        fd.append("photos", f);
-      }
-
-      // テキスト
-      fd.append("customer_text", customerTextEl.value || "");
-
-      // session_id はJSが正（存在するときだけ送る）
-      if (sessionId) {
-        fd.append("session_id", sessionId);
-      }
-
-      return fd;
-    }
-
-    function resetUIToWelcome() {
-      // welcomeはテンプレ変数なので、ここだけは安全に固定構造で復元
+    resetChatBtn.addEventListener("click", () => {
+      if (!confirm("会話を最初からやり直します。よろしいですか？")) return;
       chat.innerHTML = `
-      <div class="msg master">
-        <div class="name">マスター</div>
-        <div class="bubble">{{ welcome }}</div>
-      </div>
-    `;
-    }
-
-    // Reset: 画面 + session を切る
-    resetBtn.addEventListener("click", async () => {
-      // 送信中に押せないようにしてるが、念のため二重実行ガード
-      if (resetBtn.disabled) return;
-
-      // モーダルが出てたら消す（状態ズレ防止）
-      hideModal();
-
-      // サーバ側セッションも消す（/api/reset がある前提）
-      if (sessionId) {
-        try {
-          await fetchJson("/api/reset", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ session_id: sessionId })
-          });
-        } catch (e) {
-          // 失敗してもクライアント側は初期化する
-        }
-      }
-
-      sessionId = null;
-      sessionIdEl.value = "";
-
+        <div class="msg master">
+          <div class="name">マスター</div>
+          <div class="bubble">{{ welcome }}</div>
+        </div>
+      `;
       customerTextEl.value = "";
       photosEl.value = "";
       updateFileUI();
-
-      resetUIToWelcome();
     });
 
-    analyzeForm.addEventListener("submit", async (e) => {
-      e.preventDefault();
-
-      const files = photosEl.files;
-      if (!files || files.length === 0) {
-        updateFileUI();
-        return;
-      }
-
-      const customerText = (customerTextEl.value || "").trim();
-
-      // ユーザー表示（メッセージが空でも写真枚数は出す）
-      if (customerText) addMsg("customer", customerText);
-      addMsg("customer", `写真 ${files.length}枚`);
-
-      // 送信中UI
-      submitBtn.disabled = true;
-      resetBtn.disabled = true;
-      showModal("確認中", "写真とメッセージを読み取っています。");
-
-      try {
-        const fd = buildAnalyzeFormData();
-
-        const data = await fetchJson("/api/analyze", {
-          method: "POST",
-          body: fd
-        });
-
-        if (data.status === "need_retake") {
-          addMsg("master", data.master || "すみません、うまく読み取れませんでした。撮り直してもう一度お願いします。");
-
-          // 文面が「撮り直して」なので、写真はクリアする（再選択を促す）
-          photosEl.value = "";
-          updateFileUI();
-          return;
-        }
-
-        // session確定
-        sessionId = data.session_id || null;
-        sessionIdEl.value = sessionId || "";
-
-        addMsg("master", data.master || "（回答が空でした）");
-
-        // 次の追加送信を自然に：入力クリア
-        customerTextEl.value = "";
-        photosEl.value = "";
-        updateFileUI();
-
-      } catch (err) {
-        addMsg("master", `すみません、処理に失敗しました。\n理由：${err.message}`);
-        console.error(err);
-      } finally {
-        hideModal();
-        resetBtn.disabled = false;
-        // ファイルが残っている場合だけ送信可にする
-        updateFileUI();
-      }
-    });
-
-    // 初期状態
     updateFileUI();
   </script>
-
 </body>
-
 </html>
