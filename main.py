@@ -2,8 +2,9 @@ import os
 import re
 import uuid
 import time
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional
+import json
+from dataclasses import dataclass, asdict, field
+from typing import Any, Dict, List, Optional, Tuple
 
 import traceback
 import requests
@@ -15,6 +16,8 @@ from fastapi.templating import Jinja2Templates
 
 # Google Vision
 from google.cloud import vision
+
+from pydantic import BaseModel
 
 # ----------------------------
 # App & Templates
@@ -38,18 +41,24 @@ SESSIONS: Dict[str, Dict[str, Any]] = {}
 # UX Fixed copy
 # ----------------------------
 WELCOME_MESSAGE = "いらっしゃいませ。今日はどんなお酒を召し上がりますか？"
-UPLOAD_HINT = "成分表など（原材料・度数などが載っている箇所）が写る写真を投稿してください。"
+UPLOAD_HINT = (
+    "商品のバーコード画像、もしくは成分表（原材料、度数など）、商品名の写る写真を送ってください。\n"
+    "PCの場合は複数の画像を一度に送ってください。"
+)
 
-
+# ----------------------------
+# Data model
+# ----------------------------
 @dataclass
 class ExtractedInfo:
     category: str  # "wine" | "sake" | "shochu" | "whisky" | "beer" | "unknown"
     abv: Optional[str] = None
-    maker: Optional[str] = None          # 蔵 / winery / distillery
-    brand: Optional[str] = None          # 銘柄候補
-    region: Optional[str] = None         # 産地候補
-    grapes_or_rice: Optional[str] = None # 品種 / 原料米など
-    keywords: List[str] = None
+    maker: Optional[str] = None
+    brand: Optional[str] = None
+    region: Optional[str] = None
+    grapes_or_rice: Optional[str] = None
+    # Sonar typing対応：Noneにしない
+    keywords: List[str] = field(default_factory=list)
     raw_text_snippet: str = ""
 
 
@@ -57,11 +66,6 @@ class ExtractedInfo:
 # Utilities: OCR
 # ----------------------------
 def run_ocr(image_bytes: bytes) -> str:
-    """
-    Google Cloud Vision OCR.
-    Uses DOCUMENT_TEXT_DETECTION for better layout handling.
-    Returns OCR text (str). Raises on API error.
-    """
     client = vision.ImageAnnotatorClient()
     image = vision.Image(content=image_bytes)
     response = client.document_text_detection(image=image)
@@ -82,7 +86,7 @@ def is_readable_enough(ocr_text: str) -> bool:
 
 
 # ----------------------------
-# Utilities: Extraction (lightweight, no scoring)
+# Utilities: Extraction
 # ----------------------------
 WINE_GRAPES = [
     "Cabernet Sauvignon", "Cabernet", "Merlot", "Pinot Noir", "Syrah", "Shiraz",
@@ -206,7 +210,7 @@ def extract_info(ocr_text: str) -> ExtractedInfo:
         brand=brand,
         region=region,
         grapes_or_rice=grapes_or_rice,
-        keywords=keywords or [],
+        keywords=keywords,
         raw_text_snippet=snippet
     )
 
@@ -222,25 +226,23 @@ def call_llm(messages: List[Dict[str, str]], temperature: float = 0.6) -> str:
 
     url = f"{OPENAI_BASE_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-    }
+    payload = {"model": OPENAI_MODEL, "messages": messages, "temperature": temperature}
 
     r = requests.post(url, headers=headers, json=payload, timeout=45)
-
-    # ★ここが最重要：400の本文をログに出す（Cloud Run Logsで見える）
     if r.status_code >= 400:
         print("=== OPENAI ERROR ===")
         print("status:", r.status_code)
-        print("body:", r.text)   # ここに「どの項目が不正か」が入る
+        print("body:", r.text)
         print("payload(model):", payload.get("model"))
         raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text}")
 
     data = r.json()
     return data["choices"][0]["message"]["content"].strip()
 
+
+# ----------------------------
+# Prompts
+# ----------------------------
 def build_system_prompt() -> str:
     return """
 あなたはバーの「マスター」です。相手は「お客様」です。
@@ -263,6 +265,184 @@ def build_system_prompt() -> str:
 """
 
 
+def build_humor_prompt() -> str:
+    return """
+あなたはバーの「マスター」です。相手は「お客様」です。
+
+目的：
+お客様が送ってきた対象が「酒ではない（可能性が高い）」場合でも、冷たく突き放さず、軽いノリツッコミで楽しく返す。
+
+絶対ルール：
+- 1〜2行の軽いボケ＋ツッコミ（短く）
+- 相手を貶さない（バカにしない）
+- 商品自体を否定しない（価値を認める）
+- 最後は必ず「役に立つ一言」で締める（1行）
+- 大阪弁固定はしない。デフォルトは標準語（東京寄り）で「〜じゃん」を自然に使う
+- ただし、お客様の口調が方言っぽい場合は「語尾を少し寄せる程度」にする（やりすぎ禁止）
+
+禁止：
+- 説教、冷笑、人格否定、過度な方言の誇張、断定しすぎ
+
+出力フォーマット（必ず守る）：
+（ボケ＋ツッコミ：1〜2行）
+（役に立つ一言：1行。一般的な選び方・使い方・次に撮ると良い写真など）
+"""
+
+
+# ----------------------------
+# JSON parsing helpers (S5857対策：reluctant quantifier を使わない)
+# ----------------------------
+def _strip_code_fence(s: str) -> str:
+    """
+    ```json ... ``` みたいなコードフェンスがあれば中身だけ返す。
+    正規表現は使わない（S5857対策）。
+    """
+    if not s:
+        return ""
+    t = s.strip()
+    if "```" not in t:
+        return t
+
+    first = t.find("```")
+    if first < 0:
+        return t
+    second = t.find("```", first + 3)
+    if second < 0:
+        return t
+
+    inner = t[first + 3:second].strip()
+
+    # 先頭が "json" の場合を剥ぐ
+    if inner.lower().startswith("json"):
+        inner = inner[4:].lstrip()
+    return inner
+
+
+def _extract_first_json_object(s: str) -> str:
+    """
+    文字列から最初の { ... } を雑に抜く。
+    正規表現で .*? をやらない（S5857対策）。
+    """
+    if not s:
+        return ""
+    start = s.find("{")
+    end = s.rfind("}")
+    if 0 <= start < end:
+        return s[start:end + 1]
+    return ""
+
+
+def _safe_json_load(s: str) -> Optional[Dict[str, Any]]:
+    if not s:
+        return None
+
+    t = s.strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+
+    t2 = _strip_code_fence(t)
+    j = _extract_first_json_object(t2)
+    if not j:
+        # フェンス無しでも再トライ
+        j = _extract_first_json_object(t)
+    if not j:
+        return None
+
+    try:
+        return json.loads(j)
+    except Exception:
+        return None
+
+
+# ----------------------------
+# LLM judge + replies
+# ----------------------------
+def classify_alcohol_or_not(
+    customer_text: str,
+    ocr_snippets: List[str],
+    extracted: ExtractedInfo,
+) -> Dict[str, Any]:
+    sys = (
+        "You are a strict classifier. Do NOT write prose. Output JSON only.\n"
+        "Decide whether the item is alcoholic beverage or not, based on given hints.\n"
+        "If unsure, choose unknown.\n"
+    )
+    user = {
+        "customer_text": customer_text,
+        "extracted": asdict(extracted),
+        "ocr_text_snippets": ocr_snippets[-3:],
+        "output_json_schema": {
+            "category": "alcohol | non_alcohol | unknown",
+            "confidence": "0.0-1.0",
+            "reason": "max 1 short sentence",
+            "dialect_hint": "standard | kansai | tohoku | kyushu | other"
+        }
+    }
+    messages = [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+    ]
+    raw = call_llm(messages, temperature=0.0)
+    obj = _safe_json_load(raw) or {}
+
+    category = obj.get("category", "unknown")
+    confidence = obj.get("confidence", 0.0)
+    reason = obj.get("reason", "")
+    dialect_hint = obj.get("dialect_hint", "standard")
+
+    if category not in ("alcohol", "non_alcohol", "unknown"):
+        category = "unknown"
+    try:
+        confidence = float(confidence)
+    except Exception:
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    if dialect_hint not in ("standard", "kansai", "tohoku", "kyushu", "other"):
+        dialect_hint = "standard"
+
+    return {
+        "category": category,
+        "confidence": confidence,
+        "reason": str(reason)[:120],
+        "dialect_hint": dialect_hint,
+        "raw": str(raw)[:500],
+    }
+
+
+def humor_reply(
+    customer_text: str,
+    ocr_snippets: List[str],
+    extracted: ExtractedInfo,
+    dialect_hint: str,
+) -> str:
+    dialect_instruction = ""
+    if dialect_hint == "kansai":
+        dialect_instruction = "関西っぽい口調なら語尾を少しだけ寄せてOK（例：〜じゃん→〜やん）。やりすぎ禁止。"
+    elif dialect_hint == "tohoku":
+        dialect_instruction = "東北っぽい口調なら語尾を少しだけ柔らかく寄せてOK。やりすぎ禁止。"
+    elif dialect_hint == "kyushu":
+        dialect_instruction = "九州っぽい口調なら語尾を少しだけ寄せてOK。やりすぎ禁止。"
+    else:
+        dialect_instruction = "基本は標準語（東京寄り）。"
+
+    facts = {
+        "extracted_latest": asdict(extracted),
+        "ocr_text_snippets": ocr_snippets[-3:],
+        "customer_text": customer_text,
+        "dialect_hint": dialect_hint,
+        "dialect_instruction": dialect_instruction,
+    }
+
+    messages = [
+        {"role": "system", "content": build_humor_prompt()},
+        {"role": "user", "content": json.dumps(facts, ensure_ascii=False)},
+    ]
+    return call_llm(messages, temperature=0.75)
+
+
 def master_reply(
     extracted: ExtractedInfo,
     customer_text: str,
@@ -271,9 +451,8 @@ def master_reply(
 ) -> str:
     facts = {
         "extracted_latest": asdict(extracted),
-        "ocr_text_snippets": ocr_snippets[-3:],  # 直近3枚分だけ渡す（長すぎ防止）
+        "ocr_text_snippets": ocr_snippets[-3:],
     }
-
     context_block = (
         "【利用可能な事実（ここだけが根拠）】\n"
         f"{facts}\n\n"
@@ -283,146 +462,196 @@ def master_reply(
     )
 
     messages = [{"role": "system", "content": build_system_prompt()}]
-
-    # last few turns only
     for m in chat_history[-6:]:
         messages.append(m)
-
     messages.append({"role": "user", "content": context_block})
+
     return call_llm(messages, temperature=0.65)
 
 
 # ----------------------------
-# Routes
+# Session helpers (Cognitive Complexity対策：analyzeを薄くする)
 # ----------------------------
-@app.get("/", response_class=HTMLResponse)
-def index(request: Request):
-    return templates.TemplateResponse("index.html", {
-        "request": request,
-        "welcome": WELCOME_MESSAGE,
-        "hint": UPLOAD_HINT
+def get_or_create_session(session_id: Optional[str]) -> Tuple[str, Dict[str, Any]]:
+    if session_id and session_id in SESSIONS:
+        return session_id, SESSIONS[session_id]
+
+    new_id = str(uuid.uuid4())
+    sess = {
+        "created_at": time.time(),
+        "history": [{"role": "assistant", "content": f"マスター：{WELCOME_MESSAGE}"}],
+        "images": [],
+    }
+    SESSIONS[new_id] = sess
+    return new_id, sess
+
+
+async def read_photo_bytes(photo: UploadFile) -> bytes:
+    try:
+        return await photo.read()
+    except Exception:
+        return b""
+
+
+def add_image_record(sess: Dict[str, Any], ocr_text: str) -> None:
+    extracted_each = extract_info(ocr_text)
+    sess["images"].append({
+        "added_at": time.time(),
+        "ocr_text": ocr_text,
+        "extracted": asdict(extracted_each),
     })
 
-@app.post("/api/analyze")
-async def analyze(
-    customer_text: str = Form(""),
-    session_id: Optional[str] = Form(None),
-    photos: Optional[List[UploadFile]] = File(None),  # 任意
-):
-    """
-    Upload photo(s) and/or message -> OCR (if photos) -> master reply
-    - session_idが空なら新規セッション開始
-    - session_idがあれば、既存セッションに画像/発話を追加して再回答
-    - photos は複数枚可（なくてもOK）
-    """
 
-    # 正規化
-    customer_text = (customer_text or "").strip()
-    photo_count = len(photos) if photos else 0
-
-    # 両方ないなら「促す」
-    if photo_count == 0 and customer_text == "":
-        return {
-            "status": "need_more_info",
-            "session_id": session_id,
-            "master": "写真かメッセージのどちらかを送ってください。例えば『辛口が好き』だけでもOKです。"
-        }
-
-    # 既存セッションか新規か
-    if session_id and session_id in SESSIONS:
-        sess = SESSIONS[session_id]
-    else:
-        session_id = str(uuid.uuid4())
-        sess = {
-            "created_at": time.time(),
-            "history": [{"role": "assistant", "content": f"マスター：{WELCOME_MESSAGE}"}],
-            "images": [],  # OCRの蓄積
-        }
-        SESSIONS[session_id] = sess
-
-    # テキストが空で写真だけなら、表示用に補う（LLM入力も空よりマシ）
-    if customer_text == "":
-        customer_text_for_llm = "（写真を投稿しました）"
-    else:
-        customer_text_for_llm = customer_text
-
-    # 写真がある時だけOCR
-    ocr_texts_this_request: List[str] = []
-    if photo_count > 0:
-        for photo in photos:
-            try:
-                image_bytes = await photo.read()
-            except Exception:
-                image_bytes = b""
-
-            if not image_bytes or len(image_bytes) < 1000:
-                return {
-                    "status": "need_retake",
-                    "master": "写真の一部が受け取れませんでした。もう一度、写真を選び直して送ってください。",
-                    "session_id": session_id,
-                }
-
-            try:
-                ocr_text = run_ocr(image_bytes)
-            except Exception as e:
-                print("=== OCR ERROR ===")
-                traceback.print_exc()
-                return JSONResponse(
-                    {"status": "error", "message": f"OCRに失敗しました: {type(e).__name__}: {str(e)}"},
-                    status_code=500
-                )
-
-            if is_readable_enough(ocr_text):
-                ocr_texts_this_request.append(ocr_text)
-                extracted_each = extract_info(ocr_text)
-                sess["images"].append({
-                    "added_at": time.time(),
-                    "ocr_text": ocr_text,
-                    "extracted": asdict(extracted_each),
-                })
-
-        # 写真を送ったのに全部読めなかった場合は撮り直し促し
-        if photo_count > 0 and not ocr_texts_this_request:
-            master_msg = (
-                "成分表などの文字がうまく読み取れませんでした。\n"
-                "反射やピンぼけの可能性があります。\n"
-                "文字が大きく写るように撮って、もう一度お願いできますか？"
-            )
-            return {
-                "status": "need_retake",
-                "master": master_msg,
-                "session_id": session_id,
-            }
-
-    # 会話履歴に今回の発話を積む（写真だけでも積む）
-    sess["history"].append({"role": "user", "content": f"お客様：{customer_text_for_llm}"})
-
-    # 抽出は「今回のOCR（あれば）」＋「過去OCRも少し」から作る
-    # 1) 今回OCRがあるならそれを優先
-    if ocr_texts_this_request:
-        combined_for_extract = "\n\n".join(ocr_texts_this_request)
-    else:
-        # 2) 写真が無くメッセージだけの場合：過去OCRがあればそれを少し使う
-        last_texts = [it["ocr_text"] for it in sess["images"][-2:]]  # 直近2枚程度
-        combined_for_extract = "\n\n".join(last_texts) if last_texts else ""
-
-    extracted = extract_info(combined_for_extract) if combined_for_extract else ExtractedInfo(category="unknown", keywords=[])
-
-    # LLMへ渡すOCRスニペット（直近数件）
-    ocr_snippets: List[str] = []
-    for it in sess["images"][-6:]:
-        sn = (it["ocr_text"] or "").strip().replace("\r", "")
+def build_ocr_snippets(sess: Dict[str, Any], limit: int = 6) -> List[str]:
+    snippets: List[str] = []
+    for it in sess["images"][-limit:]:
+        sn = (it.get("ocr_text") or "").strip().replace("\r", "")
         if len(sn) > 300:
             sn = sn[:300] + "…"
-        ocr_snippets.append(sn)
+        snippets.append(sn)
+    return snippets
 
-    # LLM
+
+def build_combined_extract_text(ocr_texts_this_request: List[str], sess: Dict[str, Any]) -> str:
+    if ocr_texts_this_request:
+        return "\n\n".join(ocr_texts_this_request)
+    last_texts = [it["ocr_text"] for it in sess["images"][-2:]]
+    return "\n\n".join(last_texts) if last_texts else ""
+
+
+def normalize_customer_text(customer_text: str) -> Tuple[str, str]:
+    raw = (customer_text or "").strip()
+    return raw, (raw if raw else "（写真を投稿しました）")
+
+
+def need_more_info_response(session_id: Optional[str]) -> Dict[str, Any]:
+    return {
+        "status": "need_more_info",
+        "session_id": session_id,
+        "master": "写真かメッセージのどちらかを送ってください。例えば『辛口が好き』だけでもOKです。"
+    }
+
+
+def need_retake_response(session_id: str, msg: str) -> Dict[str, Any]:
+    return {"status": "need_retake", "master": msg, "session_id": session_id}
+
+
+async def ocr_photos_and_store(
+    sess: Dict[str, Any],
+    photos: List[UploadFile],
+    session_id: str,
+) -> Tuple[List[str], Optional[Dict[str, Any]]]:
+    ocr_texts_this_request: List[str] = []
+
+    for photo in photos:
+        image_bytes = await read_photo_bytes(photo)
+        if not image_bytes or len(image_bytes) < 1000:
+            return [], need_retake_response(
+                session_id,
+                "写真の一部が受け取れませんでした。もう一度、写真を選び直して送ってください。"
+            )
+
+        try:
+            ocr_text = run_ocr(image_bytes)
+        except Exception as e:
+            print("=== OCR ERROR ===")
+            traceback.print_exc()
+            return [], {
+                "status": "error",
+                "message": f"OCRに失敗しました: {type(e).__name__}: {str(e)}",
+                "http_status": 500
+            }
+
+        if is_readable_enough(ocr_text):
+            ocr_texts_this_request.append(ocr_text)
+            add_image_record(sess, ocr_text)
+
+    if photos and not ocr_texts_this_request:
+        return [], need_retake_response(
+            session_id,
+            "成分表などの文字がうまく読み取れませんでした。\n"
+            "反射やピンぼけの可能性があります。\n"
+            "文字が大きく写るように撮って、もう一度お願いできますか？"
+        )
+
+    return ocr_texts_this_request, None
+
+
+def choose_master_message(
+    customer_text_for_llm: str,
+    ocr_snippets: List[str],
+    extracted: ExtractedInfo,
+    history: List[Dict[str, str]],
+) -> Tuple[str, Dict[str, Any]]:
+    classification = {"category": "unknown", "confidence": 0.0, "dialect_hint": "standard", "reason": ""}
+
     try:
-        master_msg = master_reply(
-            extracted=extracted,
+        classification = classify_alcohol_or_not(
             customer_text=customer_text_for_llm,
-            chat_history=sess["history"],
             ocr_snippets=ocr_snippets,
+            extracted=extracted,
+        )
+    except Exception:
+        print("=== CLASSIFIER ERROR (ignored) ===")
+        traceback.print_exc()
+
+    should_humor = (
+        classification.get("category") == "non_alcohol"
+        and float(classification.get("confidence", 0.0)) >= 0.70
+    )
+
+    if should_humor:
+        msg = humor_reply(
+            customer_text=customer_text_for_llm,
+            ocr_snippets=ocr_snippets,
+            extracted=extracted,
+            dialect_hint=str(classification.get("dialect_hint", "standard")),
+        )
+        return msg, classification
+
+    msg = master_reply(
+        extracted=extracted,
+        customer_text=customer_text_for_llm,
+        chat_history=history,
+        ocr_snippets=ocr_snippets,
+    )
+    return msg, classification
+
+
+async def analyze_impl(
+    customer_text: str,
+    session_id: Optional[str],
+    photos: Optional[List[UploadFile]],
+) -> Any:
+    customer_text_raw, customer_text_for_llm = normalize_customer_text(customer_text)
+    photo_count = len(photos) if photos else 0
+
+    if photo_count == 0 and customer_text_raw == "":
+        return need_more_info_response(session_id)
+
+    session_id, sess = get_or_create_session(session_id)
+
+    ocr_texts_this_request: List[str] = []
+    if photos:
+        ocr_texts_this_request, err = await ocr_photos_and_store(sess, photos, session_id)
+        if err:
+            if err.get("status") == "error" and err.get("http_status"):
+                return JSONResponse({"status": "error", "message": err["message"]}, status_code=err["http_status"])
+            return err
+
+    sess["history"].append({"role": "user", "content": f"お客様：{customer_text_for_llm}"})
+
+    combined_for_extract = build_combined_extract_text(ocr_texts_this_request, sess)
+    extracted = extract_info(combined_for_extract) if combined_for_extract else ExtractedInfo(category="unknown")
+
+    ocr_snippets = build_ocr_snippets(sess, limit=6)
+
+    try:
+        master_msg, classification = choose_master_message(
+            customer_text_for_llm=customer_text_for_llm,
+            ocr_snippets=ocr_snippets,
+            extracted=extracted,
+            history=sess["history"],
         )
     except Exception as e:
         print("=== LLM ERROR ===")
@@ -443,7 +672,35 @@ async def analyze(
         "images_count": len(sess["images"]),
         "uploaded_count": photo_count,
         "accepted_count": len(ocr_texts_this_request),
+        "classification": {
+            "category": classification.get("category"),
+            "confidence": classification.get("confidence"),
+            "reason": classification.get("reason"),
+            "dialect_hint": classification.get("dialect_hint"),
+        }
     }
+
+
+# ----------------------------
+# Routes
+# ----------------------------
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request):
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "welcome": WELCOME_MESSAGE,
+        "hint": UPLOAD_HINT
+    })
+
+
+@app.post("/api/analyze")
+async def analyze(
+    customer_text: str = Form(""),
+    session_id: Optional[str] = Form(None),
+    photos: Optional[List[UploadFile]] = File(None),
+):
+    # Sonarの複雑度をここでゼロにする（実処理は別関数）
+    return await analyze_impl(customer_text=customer_text, session_id=session_id, photos=photos)
 
 
 @app.post("/api/chat")
@@ -451,9 +708,6 @@ async def chat(
     session_id: str = Form(...),
     customer_text: str = Form(...),
 ):
-    """
-    Chat continuation (no story mode)
-    """
     if session_id not in SESSIONS:
         return JSONResponse({"status": "error", "message": "セッションが見つかりません。"}, status_code=404)
 
@@ -464,31 +718,28 @@ async def chat(
 
     sess["history"].append({"role": "user", "content": f"お客様：{customer_text}"})
 
-    # 最新の抽出を使う（画像がゼロなら unknown）
     if not sess["images"]:
-        extracted = ExtractedInfo(category="unknown", keywords=[])
-        ocr_snippets = []
+        extracted = ExtractedInfo(category="unknown")
+        ocr_snippets: List[str] = []
     else:
         latest = sess["images"][-1]
         extracted = ExtractedInfo(**latest["extracted"])
-        ocr_snippets = []
-        for it in sess["images"]:
-            sn = (it["ocr_text"] or "").strip().replace("\r", "")
-            if len(sn) > 300:
-                sn = sn[:300] + "…"
-            ocr_snippets.append(sn)
+        ocr_snippets = build_ocr_snippets(sess, limit=6)
 
     try:
-        master_msg = master_reply(
-            extracted=extracted,
-            customer_text=customer_text,
-            chat_history=sess["history"],
+        master_msg, classification = choose_master_message(
+            customer_text_for_llm=customer_text,
             ocr_snippets=ocr_snippets,
+            extracted=extracted,
+            history=sess["history"],
         )
     except Exception as e:
         print("=== LLM ERROR ===")
         traceback.print_exc()
-        return JSONResponse({"status": "error", "message": f"LLMに失敗しました: {type(e).__name__}: {str(e)}"}, status_code=500)
+        return JSONResponse(
+            {"status": "error", "message": f"LLMに失敗しました: {type(e).__name__}: {str(e)}"},
+            status_code=500
+        )
 
     sess["history"].append({"role": "assistant", "content": f"マスター：{master_msg}"})
 
@@ -496,12 +747,21 @@ async def chat(
         "status": "ok",
         "master": master_msg,
         "images_count": len(sess["images"]),
+        "classification": {
+            "category": classification.get("category"),
+            "confidence": classification.get("confidence"),
+            "reason": classification.get("reason"),
+            "dialect_hint": classification.get("dialect_hint"),
+        }
     }
 
-from pydantic import BaseModel
 
+# ----------------------------
+# Reset
+# ----------------------------
 class ResetReq(BaseModel):
     session_id: str
+
 
 @app.post("/api/reset")
 def reset(req: ResetReq):
